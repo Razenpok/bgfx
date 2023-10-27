@@ -2098,6 +2098,163 @@ BX_STATIC_ASSERT(BX_COUNTOF(s_accessNames) == Access::Count, "Invalid s_accessNa
 			}
 		}
 
+		void processArguments(
+			  PipelineStateMtl* ps
+			, NSArray<MTLArgument*>* _vertexArgs
+			, NSArray<MTLArgument*>* _fragmentArgs
+			)
+		{
+			ps->m_numPredefined = 0;
+
+			for (uint32_t shaderType = 0; shaderType < 2; ++shaderType)
+			{
+				UniformBuffer*& constantBuffer = shaderType == 0
+					? ps->m_vshConstantBuffer
+					: ps->m_fshConstantBuffer
+					;
+				const int8_t fragmentBit = (1 == shaderType ? kUniformFragmentBit : 0);
+
+				for (MTLArgument* arg in (shaderType == 0 ? _vertexArgs : _fragmentArgs) )
+				{
+					BX_TRACE("arg: %s type:%d", utf8String(arg.name), arg.type);
+
+					if (arg.active)
+					{
+						if (arg.type == MTLArgumentTypeBuffer
+						&&  0 == bx::strCmp(utf8String(arg.name), SHADER_UNIFORM_NAME) )
+						{
+							BX_ASSERT(arg.index == 0, "Uniform buffer must be in the buffer slot 0.");
+							BX_ASSERT(MTLDataTypeStruct == arg.bufferDataType, "%s's type must be a struct",SHADER_UNIFORM_NAME );
+
+							if (MTLDataTypeStruct == arg.bufferDataType)
+							{
+								if (shaderType == 0)
+								{
+									ps->m_vshConstantBufferSize = uint32_t(arg.bufferDataSize);
+									ps->m_vshConstantBufferAlignment = uint32_t(arg.bufferAlignment);
+								}
+								else
+								{
+									ps->m_fshConstantBufferSize = uint32_t(arg.bufferDataSize);
+									ps->m_fshConstantBufferAlignment = uint32_t(arg.bufferAlignment);
+								}
+
+								for (MTLStructMember* uniform in arg.bufferStructType.members )
+								{
+									const char* name = utf8String(uniform.name);
+									BX_TRACE("uniform: %s type:%d", name, uniform.dataType);
+
+									MTLDataType dataType = uniform.dataType;
+									uint32_t num = 1;
+
+									if (dataType == MTLDataTypeArray)
+									{
+										dataType = uniform.arrayType.elementType;
+										num = (uint32_t)uniform.arrayType.arrayLength;
+									}
+
+									switch (dataType)
+									{
+										case MTLDataTypeFloat4:   num *= 1; break;
+										case MTLDataTypeFloat4x4: num *= 4; break;
+										case MTLDataTypeFloat3x3: num *= 3; break;
+
+										default:
+											BX_WARN(0, "Unsupported uniform MTLDataType: %d", uniform.dataType);
+											break;
+									}
+
+									const PredefinedUniform::Enum predefined = nameToPredefinedUniformEnum(name);
+
+									if (PredefinedUniform::Count != predefined)
+									{
+										ps->m_predefined[ps->m_numPredefined].m_loc   = uint32_t(uniform.offset);
+										ps->m_predefined[ps->m_numPredefined].m_count = uint16_t(num);
+										ps->m_predefined[ps->m_numPredefined].m_type  = uint8_t(predefined|fragmentBit);
+										++ps->m_numPredefined;
+									}
+									else
+									{
+										const UniformRegInfo* info = s_renderMtl->m_uniformReg.find(name);
+										BX_WARN(NULL != info, "User defined uniform '%s' is not found, it won't be set.", name);
+
+										if (NULL != info)
+										{
+											if (NULL == constantBuffer)
+											{
+												constantBuffer = UniformBuffer::create(1024);
+											}
+
+											UniformType::Enum type = convertMtlType(dataType);
+											constantBuffer->writeUniformHandle( (UniformType::Enum)(type|fragmentBit), uint32_t(uniform.offset), info->m_handle, uint16_t(num) );
+											BX_TRACE("store %s %d offset:%d", name, info->m_handle, uint32_t(uniform.offset) );
+										}
+									}
+								}
+							}
+						}
+						else if (arg.type == MTLArgumentTypeBuffer
+							 && arg.index > 0
+							 && NULL != arg.bufferStructType)
+						{
+							const char* name = utf8String(arg.name);
+							BX_UNUSED(name);
+
+							if (arg.index >= BGFX_CONFIG_MAX_TEXTURE_SAMPLERS)
+							{
+								BX_TRACE(
+									  "Binding index is too large %d max is %d. "
+									  "User defined uniform '%s' won't be set."
+									, int32_t(arg.index - 1)
+									, BGFX_CONFIG_MAX_TEXTURE_SAMPLERS - 1
+									, name
+									);
+							}
+							else
+							{
+								ps->m_bindingTypes[arg.index-1] = fragmentBit
+									? PipelineStateMtl::BindToFragmentShader
+									: PipelineStateMtl::BindToVertexShader
+									;
+								BX_TRACE("Buffer %s index: %d", name, int32_t(arg.index-1) );
+							}
+						}
+						else if (arg.type == MTLArgumentTypeTexture)
+						{
+							const char* name = utf8String(arg.name);
+
+							if (arg.index >= BGFX_CONFIG_MAX_TEXTURE_SAMPLERS)
+							{
+								BX_WARN(false, "Binding index is too large %d max is %d. User defined uniform '%s' won't be set.", int(arg.index), BGFX_CONFIG_MAX_TEXTURE_SAMPLERS - 1, name);
+							}
+							else
+							{
+								ps->m_bindingTypes[arg.index] = fragmentBit ? PipelineStateMtl::BindToFragmentShader : PipelineStateMtl::BindToVertexShader;
+								const UniformRegInfo* info = s_renderMtl->m_uniformReg.find(name);
+								if (info)
+								{
+									BX_TRACE("texture %s %d index:%d", name, info->m_handle, uint32_t(arg.index) );
+								}
+								else
+								{
+									BX_TRACE("image %s index:%d", name, uint32_t(arg.index) );
+								}
+							}
+						}
+						else if (arg.type == MTLArgumentTypeSampler)
+						{
+							BX_TRACE("sampler: %s index:%d", utf8String(arg.name), arg.index);
+						}
+					}
+				}
+
+				if (NULL != constantBuffer)
+				{
+					constantBuffer->finish();
+				}
+			}
+		}
+
 		PipelineStateMtl* getPipelineState(
 			  uint64_t _state
 			, uint32_t _rgba
